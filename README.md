@@ -7,8 +7,10 @@ open-weight model running in [Ollama](https://ollama.com) on your machine.
 By default Lazy-Commit is **preview-only**: it never stages, commits, or
 modifies anything. With `--review` you can approve individual proposed commits,
 and Lazy-Commit then creates ordinary local commits for exactly those groups.
-It never pushes, amends, resets, cleans, or rewrites history, never contacts
-GitHub, and never sends repository content off your machine.
+`lazycommit pr` drafts a pull request from your branch's commits, and only
+`lazycommit pr --publish` pushes or opens it on GitHub, each step after its own
+typed confirmation. Nothing is ever force-pushed, amended, or rewritten, and
+repository content is never sent to an external AI service.
 
 ## Install
 
@@ -76,6 +78,50 @@ offered for approval:
 Statuses: `PROPOSED` -> `APPROVED` / `REJECTED` / `BLOCKED`, then
 `COMMITTED` (with its hash), `FAILED`, or `NOT RUN` (execution stopped earlier).
 
+### Pull requests
+
+Requires the [GitHub CLI](https://cli.github.com/) for publishing only
+(`winget install --id GitHub.cli -e`, then `gh auth login`). Run these on a
+feature branch whose commits are not yet in the base branch.
+
+```sh
+lazycommit pr                         # preview title + description (no push, no GitHub)
+lazycommit pr --no-model              # preview built only from commit messages
+lazycommit pr --json                  # preview as JSON; never publishes
+lazycommit pr --show-input            # exact sanitized text the model would see
+lazycommit pr --publish               # review, edit, push (asks), create PR (asks)
+lazycommit pr --publish --draft --base develop
+```
+
+The description has Summary, Motivation (only when a commit message explains
+one), Implementation details, Testing, Known limitations (only when a commit or
+added line documents one), and Commits. Model output is checked: statements
+about tests, about files outside the diff, and about files the model was not
+shown are removed. The Testing section is always written by Lazy-Commit itself
+and says it did not run tests. If the model is unavailable or its output is
+unusable, a description built only from commit messages and Git data is shown
+(and offered in `--publish`).
+
+`--publish` flow: check `gh` login -> scan every commit not yet on the remote
+(messages, added files, and per-commit patches, so a secret added and later
+removed is still caught) -> check the remote branch (never publishes over
+diverged history) -> stop if an open PR already exists (and offer to push new
+commits to it) -> show the full title/description -> `[c]ontinue / edit
+[t]itle / edit [b]ody / [q]uit` -> type `push` -> type `create` -> report the
+PR URL GitHub returned.
+
+### Changelog
+
+```sh
+lazycommit changelog                          # preview section from this branch's commits
+lazycommit changelog --since v1.2.0 --title v1.3.0
+lazycommit changelog --write                  # insert into CHANGELOG.md after typing `write`
+```
+
+Conventional Commit types become confirmed categories; other commits are listed
+under "Unclassified (please review)" with a clearly labelled guess. The file is
+re-checked before writing and is never staged or committed.
+
 ### Demo
 
 ```sh
@@ -126,12 +172,22 @@ lazycommit --repo <that path> --model qwen2.5-coder:7b
      later groups. Successful commits are never undone automatically; the
      report shows how to undo them yourself (`git reset --soft <old HEAD>`).
 
+7. **Pull requests** (`branch.py`, `prwriter.py`, `github.py`, `prcli.py`):
+   branch, remote, base, and commits come from read-only Git (`log`,
+   `rev-list`, `ls-remote`, `config --get` ...). The only push is
+   `git push --set-upstream <remote> refs/heads/<b>:refs/heads/<b>` with no
+   force, tags, or submodules. `gh` is used only for `auth status`, `pr list`,
+   and `pr create`; its auth output is discarded and tokens are never handled.
+
 ## Tests
 
 ```sh
-pytest          # mocked model via a fake local HTTP server; temp repos only (incl. commit tests)
+pytest          # temp repos; Phase 1/2 use a local fake Ollama server, Phase 3 uses real git + a real bare remote
 mypy            # strict type checks
-LAZYCOMMIT_TEST_MODEL=qwen2.5-coder:7b pytest -m ollama   # optional real-model test
+set LAZYCOMMIT_TEST_MODEL=qwen2.5-coder:3b
+pytest -m ollama            # real local model
+set LAZYCOMMIT_GITHUB_SANDBOX=sniperchief/lazycommit-sandbox
+pytest -m github            # REAL pushes and PRs in a throwaway repo, closed afterwards
 ```
 
 ## Limitations
@@ -147,3 +203,10 @@ LAZYCOMMIT_TEST_MODEL=qwen2.5-coder:7b pytest -m ollama   # optional real-model 
 - Commit content goes through Git's normal clean filters (e.g. line-ending
   conversion, LFS), as with any `git commit`.
 - Ollama must run on loopback; a model on another LAN machine is refused.
+- Pull requests are created in the remote's own repository (no fork-to-upstream
+  PRs yet), on github.com only.
+- Binary files in outgoing commits cannot be secret-scanned; they are listed as
+  warnings, not blocked.
+- Detecting invented content is heuristic: statements about tests, unknown
+  files, and withheld files are removed, but a model can still misdescribe
+  code it was shown. Always read the description before publishing.

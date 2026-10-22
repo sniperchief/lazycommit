@@ -3,6 +3,7 @@
 The default run is a read-only preview. ``--json`` is the same preview in a
 machine-readable form for scripts; it never commits. ``--review`` is the only
 mode that can create commits, and only after interactive approval.
+``lazycommit pr`` and ``lazycommit changelog`` live in ``prcli.py``.
 
 Exit codes: 0 success (proposal shown, nothing to do, or approved commits
 created), 1 error or failed commit, 2 usage error, 3 repository in an unsafe
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from lazycommit import __version__, render, review
+from lazycommit import __version__, prcli, render, review
 from lazycommit.collect import CollectResult, Limits, collect
 from lazycommit.execute import Snapshot, blocked_reasons, take_snapshot
 from lazycommit.gitrepo import GitError, RepoState, read_state
@@ -60,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Propose logical Conventional Commits for the current Git changes "
         "using a local Ollama model. By default this is a read-only preview; use "
         "--review to approve individual commits interactively.",
+        epilog="Other commands: `lazycommit pr --help` (pull request preview/publish) and "
+        "`lazycommit changelog --help` (changelog preview/write).",
     )
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="path inside the repository (default: cwd)")
     p.add_argument("--model", default=os.environ.get("LAZYCOMMIT_MODEL"),
@@ -207,6 +210,9 @@ def run(
 ) -> int:
     """Run the CLI. ``prompt`` answers review questions (tests inject one)."""
     out = out or sys.stdout
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in prcli.COMMANDS:
+        return prcli.run(argv[0], argv[1:], out, prompt, err)
     args = build_parser().parse_args(argv)
     ui = (err or sys.stderr) if args.json else out
 

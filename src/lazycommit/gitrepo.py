@@ -20,8 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # Subcommands Lazy-Commit is allowed to run. Nothing here writes to the
-# index, working tree, refs, or objects.
-READ_ONLY_SUBCOMMANDS = frozenset({"rev-parse", "status", "diff", "ls-files", "diff-tree", "cat-file"})
+# index, working tree, refs, or objects. ``ls-remote`` reads from the network
+# but never changes anything; ``config`` is limited to reads (see run_git).
+READ_ONLY_SUBCOMMANDS = frozenset({
+    "rev-parse", "status", "diff", "ls-files", "diff-tree", "cat-file",
+    "log", "rev-list", "merge-base", "ls-remote", "config",
+})
+_CONFIG_READ_FLAGS = frozenset({"--get", "--get-regexp"})
 
 _SAFE_CONFIG = (
     "-c", "core.fsmonitor=false",
@@ -59,10 +64,11 @@ def _git_env() -> dict[str, str]:
     return env
 
 
-def run_git(cwd: Path, *args: str, check: bool = True) -> bytes:
-    """Run a read-only git command and return raw stdout."""
+def _run(cwd: Path, args: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
     if not args or args[0] not in READ_ONLY_SUBCOMMANDS:
         raise GitError(f"refusing to run non-allowlisted git command: {args[:1]}")
+    if args[0] == "config" and (len(args) < 2 or args[1] not in _CONFIG_READ_FLAGS):
+        raise GitError("refusing to run git config without --get/--get-regexp")
     cmd = ["git", "--no-pager", "--no-optional-locks", *_SAFE_CONFIG, *args]
     try:
         proc = subprocess.run(
@@ -79,10 +85,21 @@ def run_git(cwd: Path, *args: str, check: bool = True) -> bytes:
         raise GitError("git executable not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
         raise GitError(f"git {args[0]} timed out after {GIT_TIMEOUT_SECONDS}s") from exc
+    return proc
+
+
+def run_git(cwd: Path, *args: str, check: bool = True) -> bytes:
+    """Run a read-only git command and return raw stdout."""
+    proc = _run(cwd, args)
     if check and proc.returncode != 0:
         msg = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise GitError(f"git {args[0]} failed: {msg[-1] if msg else 'exit ' + str(proc.returncode)}")
     return proc.stdout
+
+
+def git_succeeds(cwd: Path, *args: str) -> bool:
+    """Run a read-only git command and report whether it exited 0."""
+    return _run(cwd, args).returncode == 0
 
 
 @dataclass

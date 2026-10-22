@@ -179,3 +179,43 @@ def snapshot(root: Path) -> dict[str, str]:
             rel = p.relative_to(root).as_posix()
             result[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
     return result
+
+
+class Script:
+    """Answers interactive questions in order, like a user typing them.
+
+    ``before`` maps a substring of a question to a callable run just before
+    that question is answered (e.g. to change the repository mid-flow).
+    """
+
+    def __init__(self, answers: list[str], before: dict[str, Callable[[str], object]] | None = None) -> None:
+        self.answers = list(answers)
+        self.before = before or {}
+        self.questions: list[str] = []
+
+    def __call__(self, question: str) -> str:
+        self.questions.append(question)
+        for key, action in self.before.items():
+            if key in question:
+                action(question)
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+
+def run_cmd(repo: Repo, *argv: str, prompt: Callable[[str], str] | None = None) -> tuple[int, str]:
+    """Run `lazycommit <argv...>` (e.g. "pr", "--no-model") against ``repo``."""
+    out = io.StringIO()
+    code = cli.run([argv[0], "--repo", str(repo.root), *argv[1:]], out=out, prompt=prompt, err=out)
+    return code, out.getvalue()
+
+
+@pytest.fixture
+def remote_repo(repo: Repo, tmp_path: Path) -> tuple[Repo, Path]:
+    """``repo`` with a real local bare repository as ``origin`` and main pushed to it."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    repo.git("remote", "add", "origin", bare.as_posix())
+    repo.git("push", "-q", "-u", "origin", "main")
+    repo.git("remote", "set-head", "origin", "main")
+    return repo, bare
