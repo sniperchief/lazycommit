@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lazycommit"
+version = "0.2.0"
+description = "Local-first agent that proposes logical Conventional Commits from messy Git changes (preview by default; commits only after explicit approval)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mypy>=1.10"]
+
+[project.scripts]
+lazycommit = "lazycommit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "ollama: integration test against a real local Ollama model (set LAZYCOMMIT_TEST_MODEL to enable)",
+]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
