@@ -35,11 +35,14 @@ _DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-color")
 
 
 class BranchError(Exception):
-    """PR/changelog preparation cannot proceed. ``code`` is the CLI exit code."""
+    """PR/changelog preparation cannot proceed.
 
-    def __init__(self, message: str, hint: str = "", code: int = 1) -> None:
+    ``code`` is the CLI exit code; ``category`` is a fixed label for telemetry.
+    """
+
+    def __init__(self, message: str, hint: str = "", code: int = 1, category: str = "branch_error") -> None:
         super().__init__(message)
-        self.hint, self.code = hint, code
+        self.hint, self.code, self.category = hint, code, category
 
 
 @dataclass
@@ -131,6 +134,7 @@ def _choose_remote(root: Path, branch: str, wanted: str | None, required: bool) 
             raise BranchError(
                 f"remote {wanted!r} is not configured",
                 "Configured remotes: " + (", ".join(available) or "none"),
+                category="no_remote",
             )
         return wanted
     upstream = _config_get(root, f"branch.{branch}.remote")
@@ -142,12 +146,14 @@ def _choose_remote(root: Path, branch: str, wanted: str | None, required: bool) 
         return available[0]
     if len(available) > 1:
         raise BranchError("several remotes are configured and none is the branch's upstream",
-                          "Pass --remote NAME (one of: " + ", ".join(available) + ").")
+                          "Pass --remote NAME (one of: " + ", ".join(available) + ").",
+                          category="invalid_argument")
     if required:
         raise BranchError(
             "no Git remote is configured; a pull request needs one",
             "Add one with `git remote add origin https://github.com/OWNER/REPO.git` "
             "and push your base branch, then run this again.",
+            category="no_remote",
         )
     return None
 
@@ -172,6 +178,7 @@ def _resolve_base(root: Path, remote: str | None, base: str | None, branch: str)
             f"you are on the base branch {branch!r}",
             "Create a feature branch for your work first (`git switch -c my-feature`), "
             "or pass a different --base.",
+            category="on_base_branch",
         )
     for name in names:
         refs = ([f"refs/remotes/{remote}/{name}"] if remote else []) + [f"refs/heads/{name}"]
@@ -182,10 +189,11 @@ def _resolve_base(root: Path, remote: str | None, base: str | None, branch: str)
     if base:
         hint = (f"Run `git fetch {remote}` to update remote branches, or " if remote else "") \
             + "pass an existing branch with --base."
-        raise BranchError(f"base branch {base!r} was not found {where}", hint)
+        raise BranchError(f"base branch {base!r} was not found {where}", hint, category="missing_base")
     raise BranchError(
         f"could not determine the base branch (tried {', '.join(names)} {where})",
         "Pass it explicitly with --base BRANCH.",
+        category="missing_base",
     )
 
 
@@ -232,22 +240,26 @@ def resolve(start: Path, *, base: str | None = None, remote: str | None = None,
     try:
         state = read_state(start)
     except GitError as exc:
-        raise BranchError(str(exc), "Run Lazy-Commit from inside a Git working tree, or pass --repo PATH.") from None
+        raise BranchError(str(exc), "Run Lazy-Commit from inside a Git working tree, or pass --repo PATH.",
+                          category="not_a_repository") from None
     if state.unsafe_reasons:
         raise BranchError(
             "the repository is in an unsafe state: " + "; ".join(state.unsafe_reasons),
             "Finish or abort the operation (e.g. `git merge --abort`), then run this again.",
-            code=3,
+            code=3, category="unsafe_repository_state",
         )
     if state.branch == "(detached)":
         raise BranchError("HEAD is detached; it is not on any branch",
-                          "Switch to the branch you want to use (`git switch BRANCH`).")
+                          "Switch to the branch you want to use (`git switch BRANCH`).",
+                          category="detached_head")
     if state.head_oid is None:
         raise BranchError(f"branch {state.branch!r} has no commits yet",
-                          "Commit your work first, for example with `lazycommit --review`.")
+                          "Commit your work first, for example with `lazycommit --review`.",
+                          category="no_unique_commits")
     for value, flag in ((base, "--base"), (remote, "--remote"), (since, "--since")):
         if value is not None and not _SAFE_NAME.match(value):
-            raise BranchError(f"invalid {flag} value", "Use a plain branch, remote, or tag name.", code=2)
+            raise BranchError(f"invalid {flag} value", "Use a plain branch, remote, or tag name.", code=2,
+                              category="invalid_argument")
 
     root, branch = state.root, state.branch
     chosen = _choose_remote(root, branch, remote, required=for_pr)
@@ -256,7 +268,8 @@ def resolve(start: Path, *, base: str | None = None, remote: str | None = None,
 
     if since:
         if not _ref_exists(root, since):
-            raise BranchError(f"--since {since!r} is not a commit, branch, or tag in this repository")
+            raise BranchError(f"--since {since!r} is not a commit, branch, or tag in this repository",
+                              category="missing_base")
         base_name, base_ref = since, since
     else:
         base_name, base_ref = _resolve_base(root, chosen, base, branch)
@@ -267,6 +280,7 @@ def resolve(start: Path, *, base: str | None = None, remote: str | None = None,
             f"branch {branch!r} has no commits that are not already in {base_name!r}",
             "Commit your work on this branch first (for example with `lazycommit --review`), "
             "or choose a different base with --base.",
+            category="no_unique_commits",
         )
     info = BranchInfo(state, branch, state.head_oid, chosen, github, base_name, base_ref, commits)
     if for_pr:
@@ -275,6 +289,7 @@ def resolve(start: Path, *, base: str | None = None, remote: str | None = None,
             raise BranchError(
                 f"the {len(commits)} commit(s) on {branch!r} make no net change compared to {base_name!r}",
                 "Their changes cancel out or are already in the base branch, so there is nothing to review.",
+                category="no_net_change",
             )
         info.shortstat = run_git(root, "diff", *_DIFF_FLAGS, "--shortstat", f"{base_ref}...HEAD") \
             .decode("utf-8", "replace").strip()

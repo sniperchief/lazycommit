@@ -4,17 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lazycommit"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-first agent that proposes logical Conventional Commits from messy Git changes (preview by default; commits only after explicit approval)."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "mypy>=1.10"]
+sentry = ["sentry-sdk>=2.0,<3"]
+dev = ["pytest>=8", "mypy>=1.10", "sentry-sdk>=2.0,<3"]
 
 [project.scripts]
 lazycommit = "lazycommit.cli:main"
+lazycommit-bench = "lazycommit.benchmark.runner:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -23,6 +25,7 @@ where = ["src"]
 testpaths = ["tests"]
 markers = [
     "ollama: integration test against a real local Ollama model (set LAZYCOMMIT_TEST_MODEL to enable)",
+    "benchmark: runs the real-model benchmark (set LAZYCOMMIT_TEST_MODEL to enable)",
     "github: pushes and opens real PRs in a throwaway GitHub repo (set LAZYCOMMIT_GITHUB_SANDBOX to enable)",
 ]
 

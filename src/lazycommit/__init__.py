@@ -5,4 +5,4 @@ The default run is a read-only preview. Commits are created only in
 the restricted, verified code in ``execute.py``.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

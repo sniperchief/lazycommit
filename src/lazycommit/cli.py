@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from lazycommit import __version__, prcli, render, review
+from lazycommit import __version__, prcli, render, review, telemetry
 from lazycommit.collect import CollectResult, Limits, collect
 from lazycommit.execute import Snapshot, blocked_reasons, take_snapshot
 from lazycommit.gitrepo import GitError, RepoState, read_state
@@ -111,12 +111,14 @@ def _plan(args: argparse.Namespace, ui: TextIO) -> _Planned:
         state = read_state(args.repo.resolve())
     except GitError as exc:
         render.error(ui, str(exc), "Run Lazy-Commit from inside a Git working tree, or pass --repo PATH.")
+        telemetry.failure("plan", "not_a_repository")
         raise _Stop(EXIT_ERROR, "error", str(exc)) from None
 
     render.header(ui, state, review=args.review)
 
     if state.unsafe_reasons:
         render.unsafe_state(ui, state)
+        telemetry.failure("plan", "unsafe_repository_state", "warning")
         raise _Stop(EXIT_UNSAFE, "unsafe", "; ".join(state.unsafe_reasons))
 
     if not state.files:
@@ -144,6 +146,7 @@ def _plan(args: argparse.Namespace, ui: TextIO) -> _Planned:
         if not unchanged:
             render.error(ui, "the repository changed while it was being analyzed",
                          "Wait for other tools to finish, then run Lazy-Commit again.")
+            telemetry.failure("plan", "repository_changed", "warning")
             raise _Stop(EXIT_STALE, "changed", "repository changed during analysis")
 
     user_prompt = build_user_prompt(state, collected)
@@ -151,6 +154,7 @@ def _plan(args: argparse.Namespace, ui: TextIO) -> _Planned:
         assert_safe(SYSTEM_PROMPT, user_prompt)
     except UnsafeInputError as exc:
         render.error(ui, str(exc), "Please report this; review the excluded files manually.")
+        telemetry.failure("plan", "unsafe_model_input")
         raise _Stop(EXIT_ERROR, "error", str(exc)) from None
 
     if args.show_input:
@@ -159,25 +163,36 @@ def _plan(args: argparse.Namespace, ui: TextIO) -> _Planned:
         ui.write("----- END SANITIZED MODEL INPUT -----\n")
         raise _Stop(EXIT_OK, "input_shown", "model input shown")
 
+    telemetry.count("files", len(collected.candidates))
+    telemetry.count("excluded_files", len(collected.excluded))
     try:
-        client = OllamaClient(args.ollama_host, timeout=args.timeout)
-        if not args.model:
-            installed = client.installed_models()
-            raise ModelError(
-                "no model selected",
-                "Pass --model NAME or set LAZYCOMMIT_MODEL. Installed models: "
-                + (", ".join(installed) or "none (run `ollama pull qwen2.5-coder:7b`, for example)"),
-            )
-        client.ensure_model(args.model)
-        ui.write(f"\nAsking local model {args.model!r} for a proposal...\n")
-        ui.flush()
-        raw = client.chat_json(args.model, SYSTEM_PROMPT, user_prompt, PLAN_SCHEMA)
-        plan = parse_plan(raw, collected.candidates)
+        with telemetry.span("model.request"):
+            client = OllamaClient(args.ollama_host, timeout=args.timeout)
+            if not args.model:
+                installed = client.installed_models()
+                raise ModelError(
+                    "no model selected",
+                    "Pass --model NAME or set LAZYCOMMIT_MODEL. Installed models: "
+                    + (", ".join(installed) or "none (run `ollama pull qwen2.5-coder:7b`, for example)"),
+                    "model_not_selected",
+                )
+            client.ensure_model(args.model)
+            ui.write(f"\nAsking local model {args.model!r} for a proposal...\n")
+            ui.flush()
+            raw = client.chat_json(args.model, SYSTEM_PROMPT, user_prompt, PLAN_SCHEMA)
+        with telemetry.span("plan.validate"):
+            plan = parse_plan(raw, collected.candidates)
+            telemetry.count("groups", len(plan.groups))
+            if plan.warnings:
+                telemetry.count("rejected_groups", len(plan.warnings))
+                telemetry.failure("plan.validate", "rejected_groups", "warning")
     except ModelError as exc:
+        telemetry.failure("model.request", exc.category)
         render.error(ui, str(exc), exc.hint)
         ui.write("No proposal was produced. Nothing was changed.\n")
         raise _Stop(EXIT_ERROR, "error", str(exc)) from None
     except InvalidPlanError as exc:
+        telemetry.failure("plan.validate", "invalid_model_output")
         render.error(ui, f"rejected model output: {exc}",
                      "Re-run, or try a different/larger model with --model.")
         ui.write("No proposal was produced. Nothing was changed.\n")
@@ -214,6 +229,11 @@ def run(
     if argv and argv[0] in prcli.COMMANDS:
         return prcli.run(argv[0], argv[1:], out, prompt, err)
     args = build_parser().parse_args(argv)
+    with telemetry.span("plan"):
+        return _run_plan(args, out, prompt, err)
+
+
+def _run_plan(args: argparse.Namespace, out: TextIO, prompt: review.Prompt | None, err: TextIO | None) -> int:
     ui = (err or sys.stderr) if args.json else out
 
     if args.review and prompt is None:
@@ -237,22 +257,33 @@ def run(
     state, collected, plan = planned.state, planned.collected, planned.plan
     if args.json:
         blocked = [blocked_reasons(g, state, collected) for g in plan.groups]
+        _record_blocked(sum(1 for b in blocked if b))
         render.plan(ui, plan, collected, planned.model)
         _write_json(out, render.plan_dict(state, plan, collected, planned.model, blocked))
         return EXIT_OK
     if args.review:
         assert prompt is not None and planned.snapshot is not None
-        outcome = review.run_review(out, prompt, state, collected, plan, planned.snapshot, planned.model)
+        with telemetry.span("commit.review"):
+            outcome = review.run_review(out, prompt, state, collected, plan, planned.snapshot, planned.model)
         return _REVIEW_EXIT[outcome]
     render.plan(out, plan, collected, planned.model)
     return EXIT_OK
 
 
+def _record_blocked(blocked: int) -> None:
+    if blocked:
+        telemetry.count("blocked_groups", blocked)
+        telemetry.failure("plan.validate", "blocked_groups", "warning")
+
+
 def main(argv: list[str] | None = None) -> int:
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(errors="replace")
+    telemetry.init()
     try:
         return run(argv)
     except KeyboardInterrupt:
         sys.stdout.write("\nInterrupted. Nothing was committed.\n")
         return EXIT_INTERRUPTED
+    finally:
+        telemetry.shutdown()

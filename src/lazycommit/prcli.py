@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, TextIO
 
-from lazycommit import __version__, branch, changelog, prwriter, render
+from lazycommit import __version__, branch, changelog, prwriter, render, telemetry
 from lazycommit.branch import BranchError, BranchInfo, PRInput
 from lazycommit.collect import Limits
 from lazycommit.github import INSTALL_HINT, ExistingPR, GitHub, GitHubError, find_gh, push_branch
@@ -121,8 +121,9 @@ def _confirm(prompt: Prompt, question: str, word: str) -> bool:
         return False
 
 
-def _branch_error(ui: TextIO, exc: BranchError) -> int:
+def _branch_error(ui: TextIO, exc: BranchError, operation: str) -> int:
     render.error(ui, str(exc), exc.hint)
+    telemetry.failure(operation, exc.category, "warning" if exc.code != 1 else "error")
     return exc.code
 
 
@@ -174,19 +175,24 @@ def _draft(args: argparse.Namespace, ui: TextIO, info: BranchInfo, pr: PRInput) 
     user_prompt = prwriter.build_prompt(info, pr)
     try:
         assert_safe(prwriter.SYSTEM_PROMPT, user_prompt)
-        client = OllamaClient(args.ollama_host, timeout=args.timeout)
-        if not args.model:
-            raise ModelError("no model selected", "Pass --model NAME or set LAZYCOMMIT_MODEL.")
-        client.ensure_model(args.model)
-        ui.write(f"\nAsking local model {args.model!r} to draft the description...\n")
-        ui.flush()
-        raw = client.chat_json(args.model, prwriter.SYSTEM_PROMPT, user_prompt, prwriter.DESCRIPTION_SCHEMA)
+        with telemetry.span("model.request"):
+            client = OllamaClient(args.ollama_host, timeout=args.timeout)
+            if not args.model:
+                raise ModelError("no model selected", "Pass --model NAME or set LAZYCOMMIT_MODEL.",
+                                 "model_not_selected")
+            client.ensure_model(args.model)
+            ui.write(f"\nAsking local model {args.model!r} to draft the description...\n")
+            ui.flush()
+            raw = client.chat_json(args.model, prwriter.SYSTEM_PROMPT, user_prompt, prwriter.DESCRIPTION_SCHEMA)
         return prwriter.parse_description(raw, info, pr), ""
     except ModelError as exc:
+        telemetry.failure("model.request", exc.category)
         return None, str(exc) + (f" ({exc.hint})" if exc.hint else "")
     except UnsafeInputError as exc:
+        telemetry.failure("model.request", "unsafe_model_input")
         return None, str(exc)
     except prwriter.InvalidDescriptionError as exc:
+        telemetry.failure("model.request", "invalid_model_output")
         return None, f"rejected model output: {exc}"
 
 
@@ -203,8 +209,12 @@ def _show(ui: TextIO, title: str, body: str, draft: prwriter.Draft, model: str |
 def run(command: str, argv: list[str], out: TextIO, prompt: Prompt | None, err: TextIO | None) -> int:
     try:
         if command == "pr":
-            return _pr(build_pr_parser().parse_args(argv), out, prompt, err)
-        return _changelog(build_changelog_parser().parse_args(argv), out, prompt)
+            args = build_pr_parser().parse_args(argv)
+            with telemetry.span("pr.publish" if args.publish else "pr.prepare"):
+                return _pr(args, out, prompt, err)
+        args = build_changelog_parser().parse_args(argv)
+        with telemetry.span("changelog"):
+            return _changelog(args, out, prompt)
     except KeyboardInterrupt:
         out.write("\nInterrupted. Check `git status` and GitHub to see what, if anything, was completed.\n")
         return EXIT_INTERRUPTED
@@ -225,7 +235,7 @@ def _pr(args: argparse.Namespace, out: TextIO, prompt: Prompt | None, err: TextI
         if args.json:
             out.write(json.dumps({"lazycommit_version": __version__, "status": "error",
                                   "message": _clean(str(exc)), "published": False}) + "\n")
-        return _branch_error(ui, exc)
+        return _branch_error(ui, exc, "pr.publish" if args.publish else "pr.prepare")
 
     _pr_header(ui, info, args.publish)
     pr = branch.collect_pr(info, Limits(args.max_file_chars, args.max_total_chars, args.max_files))
@@ -245,6 +255,7 @@ def _pr(args: argparse.Namespace, out: TextIO, prompt: Prompt | None, err: TextI
     draft, error = _draft(args, ui, info, pr)
     if draft is None:
         render.error(ui, error)
+        telemetry.failure("pr.prepare", "fallback_description", "warning")
         ui.write("Showing a description built only from commit messages and Git data instead.\n")
         draft = prwriter.fallback_draft(info, pr, error)
     body = prwriter.render_body(draft, info, pr)
@@ -336,16 +347,20 @@ def _push(ui: TextIO, prompt: Prompt, info: BranchInfo, state: str, purpose: str
     if not _unchanged(info):
         render.error(ui, "the branch changed since the preview was generated; nothing was pushed",
                      "Run `lazycommit pr --publish` again.")
+        telemetry.failure("pr.push", "repository_changed", "warning")
         return None
     try:
-        push_branch(info.root, info.remote, info.branch)
-        after, oid = branch.remote_branch_state(info)
+        with telemetry.span("pr.push"):
+            push_branch(info.root, info.remote, info.branch)
+            after, oid = branch.remote_branch_state(info)
     except (GitHubError, GitError) as exc:
         render.error(ui, str(exc), getattr(exc, "hint", ""))
+        telemetry.failure("pr.push", getattr(exc, "category", "git_error"))
         return None
     if after != branch.UP_TO_DATE:
         render.error(ui, f"git push finished but {info.remote} reports {info.branch!r} at "
                          f"{(oid or 'nothing')[:12]}, not {info.head[:12]}")
+        telemetry.failure("pr.push", "push_failed")
         return None
     ui.write(f"Pushed {info.branch} ({info.head[:12]}) to {info.remote}.\n")
     return True
@@ -375,10 +390,12 @@ def _publish(args: argparse.Namespace, ui: TextIO, prompt: Prompt, info: BranchI
     if info.github is None or info.remote is None:
         render.error(ui, f"remote {info.remote!r} does not point to a github.com repository",
                      "Publishing supports GitHub only; use --remote to pick a GitHub remote.")
+        telemetry.failure("pr.publish", "not_github")
         return EXIT_ERROR
     gh_path = find_gh()
     if gh_path is None:
         render.error(ui, "the GitHub CLI (gh) is not installed or not on PATH", INSTALL_HINT)
+        telemetry.failure("pr.publish", "gh_missing")
         ui.write(stop + "\n")
         return EXIT_ERROR
     gh = GitHub(gh_path, info.github[0], info.github[1], info.root)
@@ -391,6 +408,7 @@ def _publish(args: argparse.Namespace, ui: TextIO, prompt: Prompt, info: BranchI
             render.error(ui, "possible secrets would be pushed",
                          "Remove them from the branch history yourself (Lazy-Commit never rewrites history), "
                          "then run this again.")
+            telemetry.failure("pr.publish", "outgoing_secrets")
             ui.write(stop + "\n")
             return EXIT_ERROR
         state, _ = branch.remote_branch_state(info)
@@ -399,11 +417,13 @@ def _publish(args: argparse.Namespace, ui: TextIO, prompt: Prompt, info: BranchI
             render.error(ui, f"{info.remote}/{info.branch} has commits that your local branch does not have",
                          "Lazy-Commit never force-pushes. Integrate them first (e.g. `git pull --rebase`), "
                          "then run this again.")
+            telemetry.failure("pr.publish", "remote_diverged")
             ui.write(stop + "\n")
             return EXIT_ERROR
         existing = gh.open_prs(info.branch)
     except (GitHubError, GitError) as exc:
         render.error(ui, str(exc), getattr(exc, "hint", ""))
+        telemetry.failure("pr.publish", getattr(exc, "category", "git_error"))
         ui.write(stop + "\n")
         return EXIT_ERROR
     if existing:
@@ -412,6 +432,7 @@ def _publish(args: argparse.Namespace, ui: TextIO, prompt: Prompt, info: BranchI
     draft, error = _draft(args, ui, info, pr)
     if draft is None:
         render.error(ui, error)
+        telemetry.failure("pr.publish", "fallback_description", "warning")
         if not _confirm(prompt, "Use a description built only from commit messages and Git data instead? "
                                 "Type 'y' to use it: ", "y"):
             ui.write(stop + "\n")
@@ -429,6 +450,7 @@ def _publish(args: argparse.Namespace, ui: TextIO, prompt: Prompt, info: BranchI
     if rules:
         render.error(ui, "the title or description matches a secret pattern: " + ", ".join(rules),
                      "Edit it out and run this again.")
+        telemetry.failure("pr.publish", "outgoing_secrets")
         ui.write(stop + "\n")
         return EXIT_ERROR
 
@@ -454,14 +476,17 @@ def _publish(args: argparse.Namespace, ui: TextIO, prompt: Prompt, info: BranchI
     if not _unchanged(info):
         render.error(ui, f"the branch changed since the preview; no pull request was created{pushed_note}",
                      "Run `lazycommit pr --publish` again.")
+        telemetry.failure("pr.create", "repository_changed", "warning")
         return EXIT_STALE
     try:
         again = gh.open_prs(info.branch)
         if again:
             return _existing(ui, prompt, info, again, branch.UP_TO_DATE)
-        url = gh.create_pr(info.base, info.branch, title, body, args.draft)
+        with telemetry.span("pr.create"):
+            url = gh.create_pr(info.base, info.branch, title, body, args.draft)
     except GitHubError as exc:
         render.error(ui, f"{exc}{pushed_note}", exc.hint)
+        telemetry.failure("pr.create", exc.category)
         return EXIT_ERROR
     ui.write(f"\nCreated {kind}: {url}\n")
     return EXIT_OK
@@ -479,7 +504,7 @@ def _changelog(args: argparse.Namespace, out: TextIO, prompt: Prompt | None) -> 
         info = branch.resolve(args.repo.resolve(), base=args.base, remote=args.remote,
                               since=args.since, for_pr=False)
     except BranchError as exc:
-        return _branch_error(out, exc)
+        return _branch_error(out, exc, "changelog")
 
     log = changelog.build(info.commits)
     section = changelog.render(log, args.title, datetime.date.today().isoformat())
@@ -507,18 +532,23 @@ def _changelog(args: argparse.Namespace, out: TextIO, prompt: Prompt | None) -> 
         expected = changelog.fingerprint(path)
     except (changelog.ChangelogWriteError, OSError) as exc:
         render.error(out, str(exc))
+        telemetry.failure("changelog.write", "invalid_path")
         return EXIT_ERROR
     action = "add this section to" if path.exists() else "create"
     if not _confirm(prompt, f"Type 'write' to {action} {args.file}, or anything else to cancel: ", "write"):
         out.write("Cancelled. Nothing was written.\n")
         return EXIT_OK
     try:
-        changelog.write_section(path, section, expected)
+        with telemetry.span("changelog.write"):
+            changelog.write_section(path, section, expected)
     except changelog.ChangelogWriteError as exc:
         render.error(out, str(exc), "Run the command again to preview the current state.")
-        return EXIT_STALE if "changed since" in str(exc) else EXIT_ERROR
+        conflict = "changed since" in str(exc)
+        telemetry.failure("changelog.write", "changelog_conflict" if conflict else "changelog_write_failed")
+        return EXIT_STALE if conflict else EXIT_ERROR
     except OSError as exc:
         render.error(out, f"could not write {args.file}: {exc.strerror or type(exc).__name__}")
+        telemetry.failure("changelog.write", "changelog_write_failed")
         return EXIT_ERROR
     out.write(f"Updated {args.file}. It was not staged or committed; review it with `git diff`.\n")
     return EXIT_OK

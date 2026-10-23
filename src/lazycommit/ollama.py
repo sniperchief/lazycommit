@@ -22,11 +22,15 @@ DEFAULT_TIMEOUT_SECONDS = 180.0
 
 
 class ModelError(Exception):
-    """A problem talking to the local model, with an actionable hint."""
+    """A problem talking to the local model, with an actionable hint.
 
-    def __init__(self, message: str, hint: str = "") -> None:
+    ``category`` is a fixed, non-sensitive label used for telemetry.
+    """
+
+    def __init__(self, message: str, hint: str = "", category: str = "other") -> None:
         super().__init__(message)
         self.hint = hint
+        self.category = category
 
 
 def normalize_host(host: str) -> str:
@@ -36,7 +40,8 @@ def normalize_host(host: str) -> str:
         host = "http://" + host
     parsed = urllib.parse.urlparse(host)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ModelError(f"invalid Ollama host: {host!r}", "Use a URL like http://127.0.0.1:11434")
+        raise ModelError(f"invalid Ollama host: {host!r}", "Use a URL like http://127.0.0.1:11434",
+                         "model_refused_host")
     name = parsed.hostname
     loopback = name == "localhost"
     if not loopback:
@@ -49,6 +54,7 @@ def normalize_host(host: str) -> str:
             f"refusing non-local Ollama host {name!r}",
             "Lazy-Commit only sends repository content to a model on this machine "
             "(localhost / 127.0.0.1 / ::1).",
+            "model_refused_host",
         )
     port = parsed.port or 11434
     netloc = f"[{name}]:{port}" if ":" in name else f"{name}:{port}"
@@ -82,33 +88,38 @@ class OllamaClient:
                 detail = str(json.loads(detail).get("error", detail))
             except (ValueError, AttributeError):
                 pass
-            raise ModelError(f"Ollama returned HTTP {exc.code}: {redact(detail)}") from None
+            raise ModelError(f"Ollama returned HTTP {exc.code}: {redact(detail)}",
+                             category="model_http_error") from None
         except (TimeoutError, socket.timeout):
             raise ModelError(
                 f"Ollama did not respond within {timeout:.0f}s",
                 "Try a smaller/faster model, raise --timeout, or lower --max-total-chars.",
+                "model_timeout",
             ) from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 raise ModelError(
                     f"Ollama did not respond within {timeout:.0f}s",
                     "Try a smaller/faster model, raise --timeout, or lower --max-total-chars.",
+                    "model_timeout",
                 ) from None
             raise ModelError(
                 f"cannot reach Ollama at {self.host} ({exc.reason})",
                 "Install Ollama from https://ollama.com/download and start it "
                 "(`ollama serve`, or launch the Ollama app). Set OLLAMA_HOST if it "
                 "listens on a different local port.",
+                "model_unavailable",
             ) from None
         except (ConnectionError, OSError) as exc:
             raise ModelError(
                 f"connection to Ollama at {self.host} failed or was interrupted ({type(exc).__name__})",
                 "Check that Ollama is still running and retry.",
+                "model_unavailable",
             ) from None
         try:
             return json.loads(raw)
         except ValueError:
-            raise ModelError("Ollama returned a non-JSON HTTP response") from None
+            raise ModelError("Ollama returned a non-JSON HTTP response", category="model_bad_response") from None
 
     def installed_models(self) -> list[str]:
         data = self._request("GET", "/api/tags", None, timeout=min(self.timeout, 10.0))
@@ -125,6 +136,7 @@ class OllamaClient:
         raise ModelError(
             f"model {model!r} is not installed in Ollama (installed: {listing})",
             f"Run `ollama pull {model}`, or pick an installed model with --model / LAZYCOMMIT_MODEL.",
+            "model_not_installed",
         )
 
     def chat_json(self, model: str, system: str, user: str, schema: dict[str, Any]) -> str:
@@ -142,7 +154,8 @@ class OllamaClient:
         try:
             content = data["message"]["content"]
         except (KeyError, TypeError):
-            raise ModelError("Ollama response did not contain a chat message") from None
+            raise ModelError("Ollama response did not contain a chat message",
+                             category="model_bad_response") from None
         if not isinstance(content, str):
-            raise ModelError("Ollama response message content was not text")
+            raise ModelError("Ollama response message content was not text", category="model_bad_response")
         return content

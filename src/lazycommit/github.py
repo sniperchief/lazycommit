@@ -35,9 +35,11 @@ INSTALL_HINT = (
 
 
 class GitHubError(Exception):
-    def __init__(self, message: str, hint: str = "") -> None:
+    """``category`` is a fixed, non-sensitive label used for telemetry."""
+
+    def __init__(self, message: str, hint: str = "", category: str = "gh_error") -> None:
         super().__init__(message)
-        self.hint = hint
+        self.hint, self.category = hint, category
 
 
 def find_gh() -> str | None:
@@ -104,7 +106,8 @@ class GitHub:
         proc = self._run(["auth", "status", "--hostname", "github.com"])
         if proc.returncode != 0:  # output deliberately discarded: it can show a masked token
             raise GitHubError("the GitHub CLI is not logged in to github.com",
-                              "Run `gh auth login` (choose GitHub.com and HTTPS), then try again.")
+                              "Run `gh auth login` (choose GitHub.com and HTTPS), then try again.",
+                              "gh_unauthenticated")
 
     def open_prs(self, branch: str) -> list[ExistingPR]:
         proc = self._run(["pr", "list", f"--repo={self.slug}", f"--head={branch}", "--state=open",
@@ -129,18 +132,20 @@ class GitHub:
             args.append("--draft")
         proc = self._run(args, stdin=body)
         if proc.returncode != 0:
-            raise GitHubError(f"GitHub did not create the pull request: {_last_line(proc.stderr) or 'unknown error'}")
+            raise GitHubError(f"GitHub did not create the pull request: {_last_line(proc.stderr) or 'unknown error'}",
+                              category="pr_create_failed")
         match = _PR_URL.search(proc.stdout)
         if not match:
             raise GitHubError("gh reported success but returned no pull request URL",
-                              f"Check https://github.com/{self.slug}/pulls to see whether it was created.")
+                              f"Check https://github.com/{self.slug}/pulls to see whether it was created.",
+                              "pr_create_failed")
         return match.group(0)
 
 
 def push_command(remote: str, branch: str) -> list[str]:
     """The exact push Lazy-Commit runs. Validated; never forces."""
     if not (_SAFE_NAME.match(remote) and _SAFE_NAME.match(branch)) or any(c in branch for c in "+:^~{}"):
-        raise GitHubError("refusing to push: unsafe remote or branch name")
+        raise GitHubError("refusing to push: unsafe remote or branch name", category="invalid_argument")
     refspec = f"refs/heads/{branch}:refs/heads/{branch}"
     return ["git", "--no-pager", *_SAFE_CONFIG, "-c", "push.followTags=false",
             "push", "--porcelain", "--no-recurse-submodules", "--set-upstream", remote, refspec]
@@ -153,13 +158,15 @@ def push_branch(root: Path, remote: str, branch: str) -> None:
                               timeout=PUSH_TIMEOUT_SECONDS, shell=False, check=False)
     except subprocess.TimeoutExpired:
         raise GitHubError(f"git push timed out after {PUSH_TIMEOUT_SECONDS}s",
-                          "Check your network and whether the push completed with `git status`.") from None
+                          "Check your network and whether the push completed with `git status`.",
+                          "push_failed") from None
     except FileNotFoundError:
-        raise GitHubError("git executable not found on PATH") from None
+        raise GitHubError("git executable not found on PATH", category="push_failed") from None
     if proc.returncode != 0:
         text = (proc.stderr + proc.stdout).decode("utf-8", "replace")
         lines = [ln for ln in text.splitlines()
                  if ln.strip() and not ln.startswith(("hint:", "To ", "Done"))]
         detail = secrets.redact(lines[-1].strip())[:300] if lines else f"exit {proc.returncode}"
         raise GitHubError(f"git push failed: {detail}",
-                          "Nothing was force-pushed. Fix the problem (e.g. pull new remote commits) and retry.")
+                          "Nothing was force-pushed. Fix the problem (e.g. pull new remote commits) and retry.",
+                          "push_failed")

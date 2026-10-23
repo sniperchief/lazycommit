@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TextIO
 
-from lazycommit import render
+from lazycommit import render, telemetry
 from lazycommit.collect import CollectResult
 from lazycommit.execute import (
     APPROVED,
@@ -131,12 +131,26 @@ def _report(out: TextIO, items: list[GroupResult], run: Execution, branch: str) 
         out.write("Your other staged, unstaged, and untracked changes were left as they were.\n")
 
 
+def _record_outcome(items: list[GroupResult], run: Execution) -> None:
+    failed = [it for it in items if it.status == FAILED]
+    if any(it.commit for it in failed):
+        telemetry.failure("commit.execute", "verification_failed")
+    elif failed:
+        telemetry.failure("commit.execute", "commit_failed")
+    elif run.stale:
+        telemetry.failure("commit.execute", "repository_changed", "warning")
+
+
 def run_review(out: TextIO, prompt: Prompt, state: RepoState, collected: CollectResult,
                plan: Plan, snapshot: Snapshot, model: str) -> str:
     items = [
         GroupResult(i, g, blocked=blocked_reasons(g, state, collected))
         for i, g in enumerate(plan.groups, start=1)
     ]
+    blocked = sum(1 for it in items if it.blocked)
+    if blocked:
+        telemetry.count("blocked_groups", blocked)
+        telemetry.failure("plan.validate", "blocked_groups", "warning")
     out.write("\n" + RULE + "\n")
     out.write(f"REVIEW PROPOSED COMMITS (model: {model}) - nothing has been staged or committed\n")
     out.write(RULE + "\n")
@@ -184,8 +198,11 @@ def run_review(out: TextIO, prompt: Prompt, state: RepoState, collected: Collect
     out.write("\nRe-checking the repository and creating commits...\n")
     run = Execution(start_head=snapshot.head)
     try:
-        run = execute(state, collected, snapshot, items)
+        with telemetry.span("commit.execute"):
+            run = execute(state, collected, snapshot, items)
+            _record_outcome(items, run)
     except KeyboardInterrupt:
+        telemetry.failure("commit.execute", "interrupted", "warning")
         run.stopped = "interrupted"
         for it in items:
             if it.status == APPROVED:
