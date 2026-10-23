@@ -103,6 +103,8 @@ def plan(out: TextIO, result: Plan, collected: CollectResult, model: str) -> Non
         out.write("\nThe model did not produce any valid commit groups.\n")
     for i, g in enumerate(result.groups, start=1):
         group(out, f"[{i}]", g, collected)
+        for flag in g.flags:
+            out.write(f"    needs manual review: {_clean(flag)}\n")
     plan_notes(out, result, collected)
     out.write(
         "\nThis is a proposal. Lazy-Commit did not stage, commit, or modify anything.\n"

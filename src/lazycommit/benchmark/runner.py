@@ -110,7 +110,7 @@ def run_plan_case(case: PlanCase, workdir: Path, model_call: ModelCall | None, l
 
     blocked = [blocked_reasons(g, state, collected) for g in plan.groups]
     safety = scoring.plan_safety(plan.groups, blocked, candidates, set(case.excluded), set(case.manual),
-                                 user_prompt, FAKE_SECRETS)
+                                 user_prompt, FAKE_SECRETS, case.forbidden)
     handled = ({m.path for m in plan.manual} | {s.path for s in collected.manual + collected.excluded}
                | {f for g, reasons in zip(plan.groups, blocked) if reasons for f in g.files})
     scorable = candidates - set(case.manual)
@@ -135,7 +135,9 @@ def run_plan_case(case: PlanCase, workdir: Path, model_call: ModelCall | None, l
         "groundedness_issues": [_safe_text(i, 80) for i in issues[:10]],
         "message_problems": sorted({p for g in plan.groups for p in scoring.message_problems(g)}),
         "predicted": [{"header": _safe_text(g.header, 100), "files": g.files, "confidence": g.confidence,
-                       "blocked": bool(reasons)} for g, reasons in zip(plan.groups, blocked)],
+                       "rationale": _safe_text(g.rationale), "blocked": bool(reasons),
+                       "blocked_reasons": [_safe_text(r, 120) for r in reasons]}
+                      for g, reasons in zip(plan.groups, blocked)],
     })
     return result
 

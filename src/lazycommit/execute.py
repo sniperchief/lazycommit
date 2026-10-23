@@ -168,6 +168,7 @@ def blocked_reasons(group: Group, state: RepoState, collected: CollectResult) ->
     rename_sources = {f.orig_path: f.path for f in state.files if f.orig_path}
 
     header = group.header
+    reasons += [f"needs manual review: {flag}" for flag in group.flags]
     if not group.message.strip() or re.search(r"[\x00-\x1f\x7f]", header):
         reasons.append("commit message is empty or contains control characters")
     if secrets.contains_secret(header):

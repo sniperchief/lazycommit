@@ -6,4 +6,4 @@ afterwards; the benchmark never touches the repository you run it from.
 """
 
 BENCHMARK_NAME = "lazycommit-model-benchmark"
-BENCHMARK_VERSION = "1"
+BENCHMARK_VERSION = "2"
